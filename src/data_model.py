@@ -1,0 +1,45 @@
+"""
+This module defines the AppState class, which holds the shared state of the application.
+"""
+import threading
+from collections import deque
+import tkinter as tk
+
+from . import config
+
+class AppState:
+    """A class to hold the shared state of the application."""
+    def __init__(self):
+        # --- Data Buffers ---
+        self.data_lock = threading.Lock()
+        self.voltage_buffer = deque(maxlen=3000)
+        self.filtered_buffer = deque(maxlen=3000)
+        self.time_buffer = deque(maxlen=3000)
+        self.sample_count = 0
+
+        # --- Connection Status ---
+        self.serial_connected = False
+        self.trigger_port_connected = False
+
+        # --- MUX Control ---
+        self.mux_control_lock = threading.Lock()
+        self.mux_state_label = {
+            0: "I DERIVADA", 
+            1: "II DERIVADA", 
+            2: "III DERIVADA", 
+            3: "aVR"
+        }
+        self.current_mux_state = 0
+        
+        # --- Leads Status from ESP32 ---
+        self.loose_lead_status = [1, 1, 1, 1] # 1 for unknown/disconnected, 0 for connected
+
+        # --- UI-bound variables that affect data processing ---
+        self.ecg_gain = tk.DoubleVar(value=1.0)
+        self.voltage_offset = tk.DoubleVar(value=0.0)
+        self.r_threshold = tk.DoubleVar(value=config.R_THRESHOLD_DEFAULT)
+        self.r_distance = tk.IntVar(value=config.R_DISTANCE_DEFAULT)
+
+        # --- UI-bound variables for display only ---
+        self.window_size = tk.IntVar(value=1500)
+        self.y_max = tk.DoubleVar(value=3.5)
