@@ -7,7 +7,7 @@ SERIAL_PORT = "COM8"  # COM port for ECG data
 BAUD_RATE = 115200
 
 # --- Trigger Port Configuration ---
-TRIGGER_SERIAL_PORT = "COM9"  # COM port for sending trigger signals
+TRIGGER_SERIAL_PORT = "COM11"  # COM port for sending trigger signals
 TRIGGER_BAUD_RATE = 9600
 TRIGGER_SIGNAL = b'\x01'  # Byte to send when an R peak is detected
 
