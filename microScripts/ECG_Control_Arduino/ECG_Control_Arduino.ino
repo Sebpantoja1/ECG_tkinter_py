@@ -1,161 +1,404 @@
+#include <TimerOne.h>
 
-/*
-  ECG_Control_Arduino.ino
+// ===================== Protocolo Serial =====================
+#define CMD_TRIGGER 0x01
+#define CMD_MUX_0   '0'
+#define CMD_MUX_1   '1'
+#define CMD_MUX_2   '2'
+#define CMD_MUX_3   '3'
+#define CMD_MUX_START 'S'
+#define CMD_MUX_STOP  'X'
 
-  Este script se ejecuta en un Arduino Uno R3 y actúa como el controlador
-  principal para el hardware de adquisición de ECG.
+// ===================== Pines Relés =====================
+#define PIN_RELAY_CHARGE      2
+#define PIN_RELAY_DISCHARGE   3
+#define PIN_RELAY_POL_POS     4
+#define PIN_RELAY_POL_NEG     5
 
-  Funcionalidades:
-  1. Controla un multiplexor analógico (como el 74HC4052 o CD4052) para seleccionar
-     entre 4 derivadas de ECG.
-  2. Recibe comandos a través del puerto serial para cambiar el estado del MUX de
-     forma manual o para iniciar/detener un modo de ciclado automático.
-  3. Utiliza el Timer1 por hardware para el modo de ciclado automático, garantizando
-     precisión y un funcionamiento no bloqueante.
-  4. Recibe una señal de disparo (trigger) desde la aplicación de PC cuando se
-     detecta un pico R y genera un pulso digital en un pin de salida.
+// ===================== Pines ADC =====================
+#define PIN_ADC_CHARGE        A0
+#define PIN_ADC_DISCHARGE_POS A1
+#define PIN_ADC_DISCHARGE_NEG A2
 
-  ---------------------------------------------------------------------
-  PINOUT:
-  - Pin 2: Salida digital para el selector S0 del multiplexor.
-  - Pin 3: Salida digital para el selector S1 del multiplexor.
-  - Pin 4: Salida digital para generar el pulso de disparo (trigger out).
+// ===================== Pines MUX =====================
+#define PIN_MUX_S0            6
+#define PIN_MUX_S1            7
 
-  ---------------------------------------------------------------------
-  PROTOCOLO SERIAL (Baud Rate: 9600):
-  - Comandos recibidos desde el PC:
-    - '0': Selecciona Derivada 0 (S1=0, S0=0).
-    - '1': Selecciona Derivada 1 (S1=0, S0=1).
-    - '2': Selecciona Derivada 2 (S1=1, S0=0).
-    - '3': Selecciona Derivada 3 (S1=1, S0=1).
-    - 'S': Inicia ('Start') el modo de ciclado automático.
-    - 'X': Detiene ('Stop') el modo de ciclado automático.
-    - 0x01 (Byte): Señal de disparo de pico R. Genera un pulso en TRIGGER_OUT_PIN.
-*/
+// ===================== Parámetros Cardioversor =====================
+static const float R_SHUNT = 0.1f;         // ohm
+static const float K_DIV_CHARGE = 0.122f;  // divisor V_cap (Vadc = Vcap * K_DIV)
+static const float V_AREF = 5.0f;
+static const uint16_t ADC_MAX = 1023;
+static const float ADC_ATTENUATION = 5.0f; // factor atenuación entrada ADC ×5
+static const float C_CAP = 470e-6f;        // 470 µF capacitor
 
-// --- Pines de Control ---
-const int MUX_S0_PIN = 2;
-const int MUX_S1_PIN = 3;
-const int TRIGGER_OUT_PIN = 4;
+// Objetivos de PORCENTAJE de energía por fase (0-100%)
+static float g_target_percent_pos = 50.0f;  // % energía fase +
+static float g_target_percent_neg = 35.0f;  // % energía fase -
+// Reserva 15% mínimo para protección capacitor
+static const float MIN_RESERVE_PERCENT = 15.0f;
 
-// --- Configuración del Modo Automático ---
-const unsigned long AUTO_CYCLE_INTERVAL_MS = 2000; // Cambia de derivada cada 2 segundos
+// Voltaje objetivo de carga
+static float g_target_vcap_V = 20.0f;
 
-// --- Variables Globales ---
-// 'volatile' es crucial porque estas variables son modificadas por una
-// Interrupt Service Routine (ISR) y leídas en otras partes del código.
-volatile int currentMuxState = 0;
-volatile bool autoModeEnabled = false;
+// Energías calculadas dinámicamente
+static volatile float g_E_total_J = 0.0f;       // energía total almacenada al armar
+static volatile float g_target_energy_pos_J = 0.0f;
+static volatile float g_target_energy_neg_J = 0.0f;
 
-void setup() {
-  // Iniciar comunicación serial a la misma velocidad que la app de Python
-  Serial.begin(9600);
+// Temporizaciones (ms)
+static const uint32_t DISCH_POS_MS = 40;
+static const uint32_t DISCH_NEG_MS = 40;
+static const uint32_t SAFE_MS = 1;
+static const uint32_t CHARGE_TIMEOUT_MS = 4000;
+static const uint32_t REFRACT_MS = 200;
 
-  // Configurar pines de control como salidas
-  pinMode(MUX_S0_PIN, OUTPUT);
-  pinMode(MUX_S1_PIN, OUTPUT);
-  pinMode(TRIGGER_OUT_PIN, OUTPUT);
+// ===================== FSM Estados =====================
+enum DefibState {
+  DEFIB_IDLE,
+  DEFIB_CHARGING,
+  DEFIB_ARMED,
+  DEFIB_DISCHARGING_POS,
+  DEFIB_DISCHARGING_NEG,
+  DEFIB_SAFE,
+  DEFIB_REFRACT
+};
 
-  // Establecer el estado inicial del MUX y la salida de trigger
-  setMuxState(currentMuxState);
-  digitalWrite(TRIGGER_OUT_PIN, LOW);
+static volatile DefibState g_state = DEFIB_IDLE;
+static volatile bool g_triggerBusy = false;
+static volatile uint32_t g_phaseStartMs = 0;
+static volatile uint32_t g_chargeStartMs = 0;
+static volatile uint32_t g_refractStartMs = 0;
 
-  // --- Configuración del Timer1 por Hardware ---
-  cli(); // Deshabilitar interrupciones temporalmente
+// Energía integrada
+static volatile float g_energy_pos_J = 0.0f;
+static volatile float g_energy_neg_J = 0.0f;
 
-  // Modo CTC (Clear Timer on Compare Match)
-  TCCR1A = 0; // TCCR1A registrador a cero
-  TCCR1B = 0; // TCCR1B registrador a cero
-  TCNT1  = 0; // Inicializar contador a cero
+// ===================== ADC Timer =====================
+static const unsigned long ADC_SAMPLE_PERIOD_US = 1000; // 1 kHz
+static volatile bool g_adc_timer_active = false;
+static volatile uint16_t g_last_vcap_counts = 0;
+static uint32_t g_last_adc_us = 0;
+static float g_P_prev = 0.0f;
 
-  // Establecer el valor de comparación (OCR1A) para el intervalo deseado
-  // Frecuencia del reloj = 16MHz. Queremos un intervalo de AUTO_CYCLE_INTERVAL_MS.
-  // Usaremos un prescaler de 1024.
-  // Frecuencia del Timer = 16,000,000 / 1024 = 15625 Hz.
-  // Ticks necesarios = Frecuencia del Timer * Intervalo en segundos
-  // Ticks = 15625 * (AUTO_CYCLE_INTERVAL_MS / 1000.0)
-  unsigned long ocr_val = 15625 * (AUTO_CYCLE_INTERVAL_MS / 1000.0);
-  OCR1A = ocr_val;
+// ===================== MUX Estado =====================
+static volatile uint8_t g_mux_state = 0;
+static volatile bool g_mux_auto = false;
+static volatile uint32_t g_mux_auto_ms = 3000;
+static volatile uint32_t g_mux_last_switch = 0;
 
-  // Activar modo CTC (WGM12) y prescaler de 1024 (CS12 y CS10)
-  TCCR1B |= (1 << WGM12) | (1 << CS12) | (1 << CS10);
-
-  // Habilitar la interrupción por comparación del Timer1
-  TIMSK1 |= (1 << OCIE1A);
-
-  sei(); // Rehabilitar interrupciones
-  
-  // El timer está configurado, pero no se inicia hasta recibir el comando 'S'
-  // (En realidad, el timer ya está corriendo, pero la variable autoModeEnabled
-  // controla si la ISR hace algo o no).
+// ===================== Utilidades ADC =====================
+static inline float adc_to_volts(uint16_t counts) {
+  // Incluye factor atenuación ×5
+  return (counts / (float)ADC_MAX) * V_AREF * ADC_ATTENUATION;
 }
 
-void loop() {
-  // El loop principal solo se encarga de procesar los comandos seriales.
-  // Todo lo demás es manejado por interrupciones, lo que hace el sistema
-  // muy eficiente y receptivo.
-  if (Serial.available() > 0) {
-    handleSerialCommand();
+static inline float adc_to_vcap(uint16_t counts) {
+  float vadc = (counts / (float)ADC_MAX) * V_AREF; // sin atenuación, directo del divisor
+  return vadc / K_DIV_CHARGE;
+}
+
+// Cálculo de energía total del capacitor: E = 0.5 * C * V²
+static inline float capacitor_energy(float vcap) {
+  return 0.5f * C_CAP * vcap * vcap;
+}
+
+// ===================== ISR Timer ADC =====================
+void adc_timer_isr() {
+  if (!g_adc_timer_active) return;
+
+  uint32_t now_us = micros();
+  float dt = (g_last_adc_us == 0) ? 0.001f : (now_us - g_last_adc_us) * 1e-6f;
+  g_last_adc_us = now_us;
+
+  if (g_state == DEFIB_DISCHARGING_POS) {
+    uint16_t vload_counts = analogRead(PIN_ADC_DISCHARGE_POS);
+    float Vload = adc_to_volts(vload_counts);
+    // Corriente: asumimos que midemos caída en shunt (pin separado o cálculo indirecto)
+    // Si mides V_load directo, necesitas otro canal para V_shunt
+    // Aquí simplificamos: I ≈ Vload / (R_load_equiv), pero mejor tener shunt dedicado
+    // Para demo, usamos Vload como proxy; en producción, mide V_shunt aparte
+    float I = Vload / 10.0f; // asume carga ~10Ω equivalente (ajusta según tu circuito)
+    float P = Vload * I;
+    g_energy_pos_J += 0.5f * (g_P_prev + P) * dt;
+    g_P_prev = P;
+  } 
+  else if (g_state == DEFIB_DISCHARGING_NEG) {
+    uint16_t vload_counts = analogRead(PIN_ADC_DISCHARGE_NEG);
+    float Vload = adc_to_volts(vload_counts);
+    float I = Vload / 10.0f;
+    float P = Vload * I;
+    g_energy_neg_J += 0.5f * (g_P_prev + P) * dt;
+    g_P_prev = P;
   }
 }
 
-// --- Rutina de Servicio de Interrupción (ISR) para el Timer1 ---
-ISR(TIMER1_COMPA_vect) {
-  if (autoModeEnabled) {
-    // Incrementar el estado del MUX y volver a 0 si supera 3
-    currentMuxState++;
-    if (currentMuxState > 3) {
-      currentMuxState = 0;
+// ===================== Control Relés =====================
+static inline void set_all_relays_low() {
+  digitalWrite(PIN_RELAY_CHARGE, LOW);
+  digitalWrite(PIN_RELAY_DISCHARGE, LOW);
+  digitalWrite(PIN_RELAY_POL_POS, LOW);
+  digitalWrite(PIN_RELAY_POL_NEG, LOW);
+}
+
+// ===================== MUX Apply =====================
+static inline void mux_apply(uint8_t state) {
+  digitalWrite(PIN_MUX_S0, (state & 0x01) ? HIGH : LOW);
+  digitalWrite(PIN_MUX_S1, (state & 0x02) ? HIGH : LOW);
+  Serial.print("MUX=");
+  switch(state) {
+    case 0: Serial.println("I"); break;
+    case 1: Serial.println("II"); break;
+    case 2: Serial.println("III"); break;
+    case 3: Serial.println("aVR"); break;
+    default: Serial.println("?"); break;
+  }
+}
+
+// ===================== FSM Cardioversor =====================
+void fsm_step() {
+  uint32_t now = millis();
+
+  switch (g_state) {
+    case DEFIB_IDLE:
+      break;
+
+    case DEFIB_CHARGING: {
+      digitalWrite(PIN_RELAY_CHARGE, HIGH);
+      uint16_t c = analogRead(PIN_ADC_CHARGE);
+      g_last_vcap_counts = c;
+      float vcap = adc_to_vcap(c);
+      
+      if (vcap >= g_target_vcap_V) {
+        digitalWrite(PIN_RELAY_CHARGE, LOW);
+        
+        // Calcular energía total y objetivos por fase
+        g_E_total_J = capacitor_energy(vcap);
+        
+        // Validar porcentajes
+        float total_percent = g_target_percent_pos + g_target_percent_neg;
+        if (total_percent > (100.0f - MIN_RESERVE_PERCENT)) {
+          Serial.println("[FSM] ERROR: Porcentajes exceden límite (deben sumar <85%)");
+          set_all_relays_low();
+          g_state = DEFIB_REFRACT;
+          g_refractStartMs = now;
+          g_triggerBusy = false;
+          break;
+        }
+        
+        g_target_energy_pos_J = g_E_total_J * (g_target_percent_pos / 100.0f);
+        g_target_energy_neg_J = g_E_total_J * (g_target_percent_neg / 100.0f);
+        
+        Serial.print("[FSM] ARMED Vcap=");
+        Serial.print(vcap, 2);
+        Serial.print("V E_total=");
+        Serial.print(g_E_total_J, 4);
+        Serial.print("J E+_target=");
+        Serial.print(g_target_energy_pos_J, 4);
+        Serial.print("J (");
+        Serial.print(g_target_percent_pos, 1);
+        Serial.print("%) E-_target=");
+        Serial.print(g_target_energy_neg_J, 4);
+        Serial.print("J (");
+        Serial.print(g_target_percent_neg, 1);
+        Serial.println("%)");
+        
+        g_state = DEFIB_ARMED;
+      } else if ((now - g_chargeStartMs) >= CHARGE_TIMEOUT_MS) {
+        digitalWrite(PIN_RELAY_CHARGE, LOW);
+        set_all_relays_low();
+        g_state = DEFIB_REFRACT;
+        g_refractStartMs = now;
+        g_triggerBusy = false;
+        Serial.println("[FSM] FAIL:CHARGE_TIMEOUT");
+      }
+    } break;
+
+    case DEFIB_ARMED: {
+      g_state = DEFIB_DISCHARGING_POS;
+      g_phaseStartMs = now;
+      g_energy_pos_J = 0.0f;
+      g_P_prev = 0.0f;
+      g_last_adc_us = 0;
+      g_adc_timer_active = true;
+      
+      digitalWrite(PIN_RELAY_DISCHARGE, LOW);
+      digitalWrite(PIN_RELAY_POL_POS, HIGH);
+      digitalWrite(PIN_RELAY_POL_NEG, LOW);
+      delay(5);
+      digitalWrite(PIN_RELAY_DISCHARGE, HIGH);
+      Serial.println("[FSM] DISCH_POS start");
+    } break;
+
+    case DEFIB_DISCHARGING_POS: {
+      if (g_energy_pos_J >= g_target_energy_pos_J || (now - g_phaseStartMs) >= DISCH_POS_MS) {
+        digitalWrite(PIN_RELAY_DISCHARGE, LOW);
+        float percent_delivered = (g_E_total_J > 0) ? (g_energy_pos_J / g_E_total_J * 100.0f) : 0.0f;
+        Serial.print("[FSM] DISCH_POS end E=");
+        Serial.print(g_energy_pos_J, 4);
+        Serial.print("J (");
+        Serial.print(percent_delivered, 1);
+        Serial.println("% del total)");
+        
+        g_state = DEFIB_DISCHARGING_NEG;
+        g_phaseStartMs = now;
+        g_energy_neg_J = 0.0f;
+        g_P_prev = 0.0f;
+        g_last_adc_us = 0;
+        
+        digitalWrite(PIN_RELAY_POL_POS, LOW);
+        delay(5);
+        digitalWrite(PIN_RELAY_POL_NEG, HIGH);
+        delay(5);
+        digitalWrite(PIN_RELAY_DISCHARGE, HIGH);
+        Serial.println("[FSM] DISCH_NEG start");
+      }
+    } break;
+
+    case DEFIB_DISCHARGING_NEG: {
+      if (g_energy_neg_J >= g_target_energy_neg_J || (now - g_phaseStartMs) >= DISCH_NEG_MS) {
+        digitalWrite(PIN_RELAY_DISCHARGE, LOW);
+        digitalWrite(PIN_RELAY_POL_NEG, LOW);
+        g_adc_timer_active = false;
+        
+        float percent_delivered = (g_E_total_J > 0) ? (g_energy_neg_J / g_E_total_J * 100.0f) : 0.0f;
+        float total_delivered = g_energy_pos_J + g_energy_neg_J;
+        float total_percent = (g_E_total_J > 0) ? (total_delivered / g_E_total_J * 100.0f) : 0.0f;
+        
+        Serial.print("[FSM] DISCH_NEG end E=");
+        Serial.print(g_energy_neg_J, 4);
+        Serial.print("J (");
+        Serial.print(percent_delivered, 1);
+        Serial.println("% del total)");
+        Serial.print("[FSM] Total entregado: ");
+        Serial.print(total_delivered, 4);
+        Serial.print("J (");
+        Serial.print(total_percent, 1);
+        Serial.print("% de ");
+        Serial.print(g_E_total_J, 4);
+        Serial.println("J)");
+        
+        g_state = DEFIB_SAFE;
+        g_phaseStartMs = now;
+        Serial.println("[FSM] SAFE");
+      }
+    } break;
+
+    case DEFIB_SAFE: {
+      if ((now - g_phaseStartMs) >= SAFE_MS) {
+        set_all_relays_low();
+        g_state = DEFIB_REFRACT;
+        g_refractStartMs = now;
+        g_triggerBusy = false;
+        Serial.println("[FSM] SUCCESS -> REFRACT");
+      }
+    } break;
+
+    case DEFIB_REFRACT: {
+      if ((now - g_refractStartMs) >= REFRACT_MS) {
+        g_state = DEFIB_IDLE;
+        Serial.println("[FSM] IDLE");
+      }
+    } break;
+  }
+}
+
+// ===================== Parser Serial =====================
+void handle_serial() {
+  while (Serial.available() > 0) {
+    uint8_t b = Serial.read();
+
+    if (b == CMD_TRIGGER) {
+      if (g_state == DEFIB_IDLE && !g_triggerBusy) {
+        g_triggerBusy = true;
+        g_state = DEFIB_CHARGING;
+        g_chargeStartMs = millis();
+        g_energy_pos_J = 0.0f;
+        g_energy_neg_J = 0.0f;
+        set_all_relays_low();
+        Serial.println("[CMD] TRIGGER accepted -> CHARGING");
+      } else {
+        Serial.println("[CMD] TRIGGER rejected (BUSY/REFRACT)");
+      }
     }
-    // Actualizar los pines del MUX
-    setMuxState(currentMuxState);
+    else if (b == CMD_MUX_0) {
+      g_mux_state = 0;
+      g_mux_auto = false;
+      mux_apply(g_mux_state);
+    }
+    else if (b == CMD_MUX_1) {
+      g_mux_state = 1;
+      g_mux_auto = false;
+      mux_apply(g_mux_state);
+    }
+    else if (b == CMD_MUX_2) {
+      g_mux_state = 2;
+      g_mux_auto = false;
+      mux_apply(g_mux_state);
+    }
+    else if (b == CMD_MUX_3) {
+      g_mux_state = 3;
+      g_mux_auto = false;
+      mux_apply(g_mux_state);
+    }
+    else if (b == CMD_MUX_START) {
+      g_mux_auto = true;
+      g_mux_last_switch = millis();
+      Serial.println("[CMD] MUX AUTO ON");
+    }
+    else if (b == CMD_MUX_STOP) {
+      g_mux_auto = false;
+      Serial.println("[CMD] MUX AUTO OFF");
+    }
   }
 }
 
-// --- Función para manejar los comandos recibidos ---
-void handleSerialCommand() {
-  char command = Serial.read();
-
-  switch (command) {
-    case '0':
-    case '1':
-    case '2':
-    case '3':
-      autoModeEnabled = false; // Salir del modo automático
-      currentMuxState = command - '0'; // Convertir char a int
-      setMuxState(currentMuxState);
-      Serial.print("MUX set to state: ");
-      Serial.println(currentMuxState);
-      break;
-
-    case 'S':
-      autoModeEnabled = true;
-      Serial.println("Auto-cycle mode STARTED.");
-      break;
-
-    case 'X':
-      autoModeEnabled = false;
-      Serial.println("Auto-cycle mode STOPPED.");
-      break;
-
-    case 0x01: // Byte de disparo del pico R
-      pulseTriggerPin();
-      break;
+// ===================== MUX Auto =====================
+void mux_auto_step() {
+  if (!g_mux_auto) return;
+  uint32_t now = millis();
+  if ((now - g_mux_last_switch) >= g_mux_auto_ms) {
+    g_mux_last_switch = now;
+    g_mux_state = (g_mux_state + 1) % 4;
+    mux_apply(g_mux_state);
   }
 }
 
-// --- Función para establecer el estado del multiplexor ---
-void setMuxState(int state) {
-  // Convierte el estado (0-3) a señales binarias para S0 y S1
-  digitalWrite(MUX_S0_PIN, (state & 1));      // Bit 0 del estado
-  digitalWrite(MUX_S1_PIN, ((state >> 1) & 1)); // Bit 1 del estado
+// ===================== Setup =====================
+void setup() {
+  Serial.begin(9600);
+  analogReference(DEFAULT);
+
+  pinMode(PIN_RELAY_CHARGE, OUTPUT);
+  pinMode(PIN_RELAY_DISCHARGE, OUTPUT);
+  pinMode(PIN_RELAY_POL_POS, OUTPUT);
+  pinMode(PIN_RELAY_POL_NEG, OUTPUT);
+  set_all_relays_low();
+
+  pinMode(PIN_ADC_CHARGE, INPUT);
+  pinMode(PIN_ADC_DISCHARGE_POS, INPUT);
+  pinMode(PIN_ADC_DISCHARGE_NEG, INPUT);
+
+  pinMode(PIN_MUX_S0, OUTPUT);
+  pinMode(PIN_MUX_S1, OUTPUT);
+  mux_apply(g_mux_state);
+
+  Timer1.initialize(ADC_SAMPLE_PERIOD_US);
+  Timer1.attachInterrupt(adc_timer_isr);
+
+  Serial.println("READY");
+  Serial.print("Config: Vcap_target=");
+  Serial.print(g_target_vcap_V, 1);
+  Serial.print("V E+%=");
+  Serial.print(g_target_percent_pos, 1);
+  Serial.print(" E-%=");
+  Serial.println(g_target_percent_neg, 1);
 }
 
-// --- Función para generar un pulso de disparo ---
-void pulseTriggerPin() {
-  // Genera un pulso corto (100 microsegundos) en el pin de disparo.
-  // Se usa delayMicroseconds para una pausa muy corta y precisa.
-  digitalWrite(TRIGGER_OUT_PIN, HIGH);
-  delayMicroseconds(100);
-  digitalWrite(TRIGGER_OUT_PIN, LOW);
+// ===================== Loop =====================
+void loop() {
+  handle_serial();
+  fsm_step();
+  mux_auto_step();
+  delay(1);
 }
