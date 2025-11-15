@@ -71,7 +71,7 @@ Para gestionar las dependencias se utiliza `uv`, un gestor de paquetes rápido p
 
 4.  **Ejecutar la Aplicación:**
     ```bash
-    python main.py
+    uv run main.py
     ```
 
 ## Configuración
