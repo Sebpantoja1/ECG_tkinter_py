@@ -7,7 +7,7 @@ SERIAL_PORT = "COM8"  # COM port for ECG data
 BAUD_RATE = 115200
 
 # --- Trigger Port Configuration ---
-TRIGGER_SERIAL_PORT = "COM9"  # COM port for sending trigger signals
+TRIGGER_SERIAL_PORT = "COM13"  # COM port for sending trigger signals
 TRIGGER_BAUD_RATE = 9600
 TRIGGER_SIGNAL = b'\x01'  # Byte to send when an R peak is detected
 
@@ -20,7 +20,7 @@ SAMPLE_RATE = 2000  # Hz (adjust according to your ESP32)
 ENABLE_FILTERS = True  # Enable/disable filters
 
 # --- UI and Plotting Configuration ---
-REFRESH_INTERVAL = 50  # GUI refresh rate in ms
+REFRESH_INTERVAL =  30  # GUI refresh rate in ms
 
 # --- Peak Detection Parameters ---
 R_THRESHOLD_DEFAULT = 1.0  # Default R-peak threshold in Volts
