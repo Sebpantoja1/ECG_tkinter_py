@@ -19,7 +19,7 @@ class AppState:
 
         # --- Connection Status ---
         self.serial_connected = False
-        self.trigger_port_connected = False
+        self.arduino_connected = False
 
         # --- MUX Control ---
         self.mux_control_lock = threading.Lock()
@@ -31,8 +31,7 @@ class AppState:
         }
         self.current_mux_state = 0
         
-        # --- Leads Status from ESP32 ---
-        self.loose_lead_status = [1, 1, 1, 1] # 1 for unknown/disconnected, 0 for connected
+
 
         # --- UI-bound variables that affect data processing ---
         self.ecg_gain = tk.DoubleVar(value=1.0)

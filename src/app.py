@@ -123,7 +123,7 @@ class ECGApp(tk.Tk):
         panel = ttk.LabelFrame(parent, text="System Status", padding="10")
         panel.pack(fill=tk.X, pady=10)
         self.status_labels = {}
-        labels = ["ECG Connection", "Trigger Port", "Samples", "BPM", "Signal Quality", "Derivation", "Electrodes"]
+        labels = ["ECG Connection", "Arduino", "Samples", "BPM", "Signal Quality", "Derivation"]
         for i, text in enumerate(labels):
             ttk.Label(panel, text=f"{text}:").grid(row=i, column=0, sticky="w", pady=2)
             self.status_labels[text] = ttk.Label(panel, text="N/A")
@@ -181,9 +181,7 @@ class ECGApp(tk.Tk):
         self.canvas.draw()
 
     def update_status_labels(self, y_raw, y_filtered):
-        # Connection status
-        self.status_labels["ECG Connection"].config(text=f"{'🟢 Connected' if self.app_state.serial_connected else '🔴 Disconnected'}")
-        self.status_labels["Trigger Port"].config(text=f"{'🟢 Connected' if self.app_state.trigger_port_connected else '🔴 Disconnected'}")
+        self.status_labels["Arduino"].config(text=f"{'🟢 Connected' if self.app_state.arduino_connected else '🔴 Disconnected'}")
         self.status_labels["Samples"].config(text=f"{self.app_state.sample_count}")
 
         # BPM
@@ -211,11 +209,6 @@ class ECGApp(tk.Tk):
             else:
                 mux_text = "Stopped"
         self.status_labels["Derivation"].config(text=mux_text)
-        
-        # Electrodes status
-        with self.app_state.data_lock:
-            status_str = " ".join(["🟢" if s == 0 else "🔴" for s in self.app_state.loose_lead_status])
-        self.status_labels["Electrodes"].config(text=status_str)
 
     def on_closing(self):
         self.is_running = False
