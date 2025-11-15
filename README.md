@@ -38,11 +38,11 @@ El sistema se compone de tres partes principales que se comunican vía puertos s
     - `app.py`: Lógica de la interfaz de usuario con Tkinter.
     - `serial_handler.py`: Gestiona la comunicación serial. Lee datos del ESP32 y envía comandos al Arduino.
     - `config.py`, `data_model.py`, `filters.py`, `peak_detection.py`: Módulos con responsabilidades separadas para configuración, estado, filtros y detección de picos.
-- `arduScript/`: Contiene el código fuente (`.ino`) para el microcontrolador Arduino Uno.
+- `microScripts/ECG_Control_Arduino/`: Contiene el código fuente (`.ino`) para el microcontrolador Arduino Uno.
 
 ## Código del Arduino
 
-Dentro de la carpeta `arduScript/` se encuentra el archivo `ECG_Control_Arduino.ino`. Este código debe ser cargado en la placa Arduino Uno R3 utilizando el [Arduino IDE](https://www.arduino.cc/en/software).
+Dentro de la carpeta `microScripts/ECG_Control_Arduino/` se encuentra el archivo `ECG_Control_Arduino.ino`. Este código debe ser cargado en la placa Arduino Uno R3 utilizando el [Arduino IDE](https://www.arduino.cc/en/software).
 
 El script está diseñado para ser eficiente, utilizando interrupciones y temporizadores de hardware para controlar el multiplexor y las señales de disparo sin bloquear el microcontrolador. El código está completamente comentado para facilitar su comprensión y modificación.
 
