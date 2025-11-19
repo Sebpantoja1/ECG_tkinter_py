@@ -1,7 +1,9 @@
 import serial
 import time
 import threading
+import re
 from collections import deque
+from typing import Optional
 from . import config
 
 class SerialReader:
@@ -92,17 +94,29 @@ class SerialReader:
                 else:
                     self.app_state.arduino_connected = True
                 
-                # Read from ESP32
+                # Read from ESP32 (con límite de bytes para evitar bloqueos)
                 if self.ser.in_waiting > 0:
-                    raw_bytes = self.ser.read(self.ser.in_waiting)
-                    self.process_raw_bytes(raw_bytes)
+                    # Limitar lectura a 512 bytes por iteración para evitar bloqueos
+                    bytes_to_read = min(self.ser.in_waiting, 512)
+                    raw_bytes = self.ser.read(bytes_to_read)
+                    if raw_bytes:
+                        self.process_raw_bytes(raw_bytes)
 
-                time.sleep(0.005)
+                time.sleep(0.001)  # Reducir sleep para mejor responsividad
+            except serial.SerialException as e:
+                print(f"Serial error: {e}")
+                self.app_state.serial_connected = False
+                self.app_state.arduino_connected = False
+                if self.ser and self.ser.is_open:
+                    try:
+                        self.ser.close()
+                    except:
+                        pass
+                time.sleep(0.5)  # Reintentar más rápido
             except Exception as e:
                 print(f"Error in serial reading loop: {e}")
                 self.app_state.serial_connected = False
-                self.app_state.arduino_connected = False
-                time.sleep(1)
+                time.sleep(0.5)
 
     def process_raw_bytes(self, raw_bytes):
         # ESP32 only sends ADC data, so no need to check for special messages.
@@ -185,3 +199,85 @@ class SerialReader:
                     self.app_state.current_mux_state = -2 # MUX stopped
             except Exception as e:
                 print(f"Error sending command to Arduino: {e}")
+
+    def send_config(self, vcap: float, percent_pos: float, percent_neg: float):
+        """Envía configuración al Arduino"""
+        msg = f"CFG:{vcap:.1f}:{percent_pos:.1f}:{percent_neg:.1f}\n"
+        if self.arduino_ser and self.arduino_ser.is_open:
+            try:
+                self.arduino_ser.write(msg.encode())
+            except Exception as e:
+                print(f"Error sending config to Arduino: {e}")
+                self.app_state.arduino_connected = False
+
+    def send_trigger(self):
+        """Envía señal de trigger al Arduino"""
+        if self.arduino_ser and self.arduino_ser.is_open:
+            try:
+                self.arduino_ser.write(config.TRIGGER_SIGNAL)
+            except Exception as e:
+                print(f"Error sending trigger to Arduino: {e}")
+                self.app_state.arduino_connected = False
+
+    def parse_arduino_data(self, line: str) -> Optional[dict]:
+        """
+        Parsea mensajes del Arduino:
+        - [FSM] ARMED Vcap=20.5V E_total=0.0987J ...
+        - [FSM] DISCH_POS end E=0.0494J (50.0% del total)
+        """
+        if line.startswith("[FSM]"):
+            # Extraer datos con regex
+            return self._parse_fsm_message(line)
+        return None
+
+    def _parse_fsm_message(self, line: str) -> Optional[dict]:
+        """
+        Parsea mensajes tipo:
+        [FSM] ARMED Vcap=20.5V E_total=0.0987J E+_target=0.0494J (50.0%) ...
+        [FSM] DISCH_POS end E=0.0494J (50.1% del total)
+        """
+        import re
+        
+        result = {}
+        
+        # Detectar tipo de mensaje
+        if "ARMED" in line:
+            result['type'] = 'armed'
+            # Extraer Vcap
+            match = re.search(r'Vcap=([\d.]+)V', line)
+            if match:
+                result['vcap'] = float(match.group(1))
+            # Extraer E_total
+            match = re.search(r'E_total=([\d.]+)J', line)
+            if match:
+                result['e_total'] = float(match.group(1))
+                
+        elif "DISCH_POS end" in line:
+            result['type'] = 'discharge_pos_end'
+            match = re.search(r'E=([\d.]+)J', line)
+            if match:
+                result['energy'] = float(match.group(1))
+            match = re.search(r'\(([\d.]+)% del total\)', line)
+            if match:
+                result['percent'] = float(match.group(1))
+                
+        elif "DISCH_NEG end" in line:
+            result['type'] = 'discharge_neg_end'
+            match = re.search(r'E=([\d.]+)J', line)
+            if match:
+                result['energy'] = float(match.group(1))
+            match = re.search(r'\(([\d.]+)% del total\)', line)
+            if match:
+                result['percent'] = float(match.group(1))
+                
+        elif "Total entregado" in line:
+            result['type'] = 'discharge_complete'
+            # Extraer totales
+            match = re.search(r'Total entregado[:\s]+([\d.]+)J', line)
+            if match:
+                result['total_energy'] = float(match.group(1))
+            match = re.search(r'\(([\d.]+)%\)', line)
+            if match:
+                result['total_percent'] = float(match.group(1))
+                
+        return result if result else None

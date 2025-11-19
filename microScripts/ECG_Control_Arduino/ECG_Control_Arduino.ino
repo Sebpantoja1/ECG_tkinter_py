@@ -1,4 +1,5 @@
 #include <TimerOne.h>
+#include <string.h>
 
 // ===================== Protocolo Serial =====================
 #define CMD_TRIGGER 0x01
@@ -8,6 +9,7 @@
 #define CMD_MUX_3   '3'
 #define CMD_MUX_START 'S'
 #define CMD_MUX_STOP  'X'
+#define CMD_CONFIG 'C'  // Configuración: CFG:vcap:pos:neg
 
 // ===================== Pines Relés =====================
 #define PIN_RELAY_CHARGE      2
@@ -19,6 +21,7 @@
 #define PIN_ADC_CHARGE        A0
 #define PIN_ADC_DISCHARGE_POS A1
 #define PIN_ADC_DISCHARGE_NEG A2
+#define PIN_ADC_CURRENT_SHUNT A3  // Nuevo pin para medir corriente
 
 // ===================== Pines MUX =====================
 #define PIN_MUX_S0            6
@@ -81,11 +84,43 @@ static volatile uint16_t g_last_vcap_counts = 0;
 static uint32_t g_last_adc_us = 0;
 static float g_P_prev = 0.0f;
 
+// ===================== Integración Simpson =====================
+static const uint8_t SIMPSON_BUFFER_SIZE = 10;
+static float g_power_buffer[SIMPSON_BUFFER_SIZE];
+static uint8_t g_buffer_idx = 0;
+static bool g_buffer_full = false;
+
+// Integración de Simpson: más preciso que trapezoidal
+// I = (dt/3) * [P0 + 4*P1 + 2*P2 + 4*P3 + ... + Pn]
+float simpson_integrate(float dt) {
+  if (!g_buffer_full) return 0.0f;
+  
+  float integral = g_power_buffer[0];
+  
+  for (uint8_t i = 1; i < SIMPSON_BUFFER_SIZE - 1; i++) {
+    float coeff = (i % 2 == 1) ? 4.0f : 2.0f;
+    integral += coeff * g_power_buffer[i];
+  }
+  
+  integral += g_power_buffer[SIMPSON_BUFFER_SIZE - 1];
+  integral *= (dt / 3.0f);
+  
+  return integral;
+}
+
 // ===================== MUX Estado =====================
 static volatile uint8_t g_mux_state = 0;
 static volatile bool g_mux_auto = false;
 static volatile uint32_t g_mux_auto_ms = 3000;
 static volatile uint32_t g_mux_last_switch = 0;
+
+// ===================== Buffer Serial =====================
+static char g_serial_buffer[64];
+static uint8_t g_buffer_len = 0;
+
+// ===================== Status Report =====================
+static uint32_t g_last_status_report = 0;
+static const uint32_t STATUS_REPORT_INTERVAL_MS = 1000;
 
 // ===================== Utilidades ADC =====================
 static inline float adc_to_volts(uint16_t counts) {
@@ -114,22 +149,56 @@ void adc_timer_isr() {
   if (g_state == DEFIB_DISCHARGING_POS) {
     uint16_t vload_counts = analogRead(PIN_ADC_DISCHARGE_POS);
     float Vload = adc_to_volts(vload_counts);
-    // Corriente: asumimos que midemos caída en shunt (pin separado o cálculo indirecto)
-    // Si mides V_load directo, necesitas otro canal para V_shunt
-    // Aquí simplificamos: I ≈ Vload / (R_load_equiv), pero mejor tener shunt dedicado
-    // Para demo, usamos Vload como proxy; en producción, mide V_shunt aparte
-    float I = Vload / 10.0f; // asume carga ~10Ω equivalente (ajusta según tu circuito)
+    
+    // Leer corriente desde shunt dedicado
+    uint16_t ishunt_counts = analogRead(PIN_ADC_CURRENT_SHUNT);
+    float V_shunt = adc_to_volts(ishunt_counts);
+    float I = V_shunt / R_SHUNT;
+    
     float P = Vload * I;
-    g_energy_pos_J += 0.5f * (g_P_prev + P) * dt;
-    g_P_prev = P;
+    
+    // Agregar a buffer Simpson
+    g_power_buffer[g_buffer_idx] = P;
+    g_buffer_idx++;
+    if (g_buffer_idx >= SIMPSON_BUFFER_SIZE) {
+      g_buffer_idx = 0;
+      g_buffer_full = true;
+    }
+    
+    // Integrar cada N muestras
+    if (g_buffer_full) {
+      g_energy_pos_J += simpson_integrate(dt * SIMPSON_BUFFER_SIZE);
+      // Reset buffer
+      g_buffer_full = false;
+      g_buffer_idx = 0;
+    }
   } 
   else if (g_state == DEFIB_DISCHARGING_NEG) {
     uint16_t vload_counts = analogRead(PIN_ADC_DISCHARGE_NEG);
     float Vload = adc_to_volts(vload_counts);
-    float I = Vload / 10.0f;
+    
+    // Leer corriente desde shunt dedicado
+    uint16_t ishunt_counts = analogRead(PIN_ADC_CURRENT_SHUNT);
+    float V_shunt = adc_to_volts(ishunt_counts);
+    float I = V_shunt / R_SHUNT;
+    
     float P = Vload * I;
-    g_energy_neg_J += 0.5f * (g_P_prev + P) * dt;
-    g_P_prev = P;
+    
+    // Agregar a buffer Simpson
+    g_power_buffer[g_buffer_idx] = P;
+    g_buffer_idx++;
+    if (g_buffer_idx >= SIMPSON_BUFFER_SIZE) {
+      g_buffer_idx = 0;
+      g_buffer_full = true;
+    }
+    
+    // Integrar cada N muestras
+    if (g_buffer_full) {
+      g_energy_neg_J += simpson_integrate(dt * SIMPSON_BUFFER_SIZE);
+      // Reset buffer
+      g_buffer_full = false;
+      g_buffer_idx = 0;
+    }
   }
 }
 
@@ -220,6 +289,8 @@ void fsm_step() {
       g_energy_pos_J = 0.0f;
       g_P_prev = 0.0f;
       g_last_adc_us = 0;
+      g_buffer_idx = 0;
+      g_buffer_full = false;
       g_adc_timer_active = true;
       
       digitalWrite(PIN_RELAY_DISCHARGE, LOW);
@@ -245,6 +316,8 @@ void fsm_step() {
         g_energy_neg_J = 0.0f;
         g_P_prev = 0.0f;
         g_last_adc_us = 0;
+        g_buffer_idx = 0;
+        g_buffer_full = false;
         
         digitalWrite(PIN_RELAY_POL_POS, LOW);
         delay(5);
@@ -304,51 +377,100 @@ void fsm_step() {
 }
 
 // ===================== Parser Serial =====================
+void parse_config_command(char* buf) {
+  // Parsear "CFG:20.0:50.0:35.0"
+  char* token = strtok(buf, ":");
+  if (strcmp(token, "CFG") != 0) return;
+  
+  token = strtok(NULL, ":");
+  if (token) g_target_vcap_V = atof(token);
+  
+  token = strtok(NULL, ":");
+  if (token) g_target_percent_pos = atof(token);
+  
+  token = strtok(NULL, ":");
+  if (token) g_target_percent_neg = atof(token);
+  
+  Serial.print("[CFG] Updated: Vcap=");
+  Serial.print(g_target_vcap_V);
+  Serial.print("V Pos=");
+  Serial.print(g_target_percent_pos);
+  Serial.print("% Neg=");
+  Serial.print(g_target_percent_neg);
+  Serial.println("%");
+}
+
 void handle_serial() {
   while (Serial.available() > 0) {
-    uint8_t b = Serial.read();
-
-    if (b == CMD_TRIGGER) {
+    char c = Serial.read();
+    
+    // Comandos de un byte (legacy)
+    if (c == CMD_TRIGGER) {
       if (g_state == DEFIB_IDLE && !g_triggerBusy) {
         g_triggerBusy = true;
         g_state = DEFIB_CHARGING;
         g_chargeStartMs = millis();
         g_energy_pos_J = 0.0f;
         g_energy_neg_J = 0.0f;
+        g_buffer_idx = 0;
+        g_buffer_full = false;
         set_all_relays_low();
         Serial.println("[CMD] TRIGGER accepted -> CHARGING");
       } else {
         Serial.println("[CMD] TRIGGER rejected (BUSY/REFRACT)");
       }
+      continue;
     }
-    else if (b == CMD_MUX_0) {
+    else if (c == CMD_MUX_0) {
       g_mux_state = 0;
       g_mux_auto = false;
       mux_apply(g_mux_state);
+      continue;
     }
-    else if (b == CMD_MUX_1) {
+    else if (c == CMD_MUX_1) {
       g_mux_state = 1;
       g_mux_auto = false;
       mux_apply(g_mux_state);
+      continue;
     }
-    else if (b == CMD_MUX_2) {
+    else if (c == CMD_MUX_2) {
       g_mux_state = 2;
       g_mux_auto = false;
       mux_apply(g_mux_state);
+      continue;
     }
-    else if (b == CMD_MUX_3) {
+    else if (c == CMD_MUX_3) {
       g_mux_state = 3;
       g_mux_auto = false;
       mux_apply(g_mux_state);
+      continue;
     }
-    else if (b == CMD_MUX_START) {
+    else if (c == CMD_MUX_START) {
       g_mux_auto = true;
       g_mux_last_switch = millis();
       Serial.println("[CMD] MUX AUTO ON");
+      continue;
     }
-    else if (b == CMD_MUX_STOP) {
+    else if (c == CMD_MUX_STOP) {
       g_mux_auto = false;
       Serial.println("[CMD] MUX AUTO OFF");
+      continue;
+    }
+    
+    // Comandos multi-byte (nuevos)
+    if (c == '\n') {
+      g_serial_buffer[g_buffer_len] = '\0';
+      
+      // Parsear comando
+      if (strncmp(g_serial_buffer, "CFG:", 4) == 0) {
+        parse_config_command(g_serial_buffer);
+      }
+      
+      g_buffer_len = 0;
+    } else {
+      if (g_buffer_len < sizeof(g_serial_buffer) - 1) {
+        g_serial_buffer[g_buffer_len++] = c;
+      }
     }
   }
 }
@@ -378,6 +500,7 @@ void setup() {
   pinMode(PIN_ADC_CHARGE, INPUT);
   pinMode(PIN_ADC_DISCHARGE_POS, INPUT);
   pinMode(PIN_ADC_DISCHARGE_NEG, INPUT);
+  pinMode(PIN_ADC_CURRENT_SHUNT, INPUT);
 
   pinMode(PIN_MUX_S0, OUTPUT);
   pinMode(PIN_MUX_S1, OUTPUT);
@@ -395,10 +518,27 @@ void setup() {
   Serial.println(g_target_percent_neg, 1);
 }
 
+// ===================== Status Report =====================
+void report_status() {
+  uint32_t now = millis();
+  if (now - g_last_status_report < STATUS_REPORT_INTERVAL_MS) return;
+  g_last_status_report = now;
+  
+  // Solo reportar si hay algo que reportar
+  if (g_state == DEFIB_CHARGING) {
+    uint16_t c = analogRead(PIN_ADC_CHARGE);
+    float vcap = adc_to_vcap(c);
+    Serial.print("[STATUS] CHARGING Vcap=");
+    Serial.print(vcap, 2);
+    Serial.println("V");
+  }
+}
+
 // ===================== Loop =====================
 void loop() {
   handle_serial();
   fsm_step();
   mux_auto_step();
+  report_status();  // NUEVO
   delay(1);
 }

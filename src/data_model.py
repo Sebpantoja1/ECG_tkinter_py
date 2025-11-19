@@ -3,6 +3,8 @@ This module defines the AppState class, which holds the shared state of the appl
 """
 import threading
 from collections import deque
+from dataclasses import dataclass, field
+from typing import List, Optional
 import tkinter as tk
 
 from . import config
@@ -42,3 +44,19 @@ class AppState:
         # --- UI-bound variables for display only ---
         self.window_size = tk.IntVar(value=1500)
         self.y_max = tk.DoubleVar(value=3.5)
+
+
+@dataclass
+class ECGDataModel:
+    # Existentes...
+    raw_data: deque
+    filtered_data: deque
+    
+    # NUEVOS campos Pan-Tompkins
+    r_peaks: List[int] = field(default_factory=list)
+    rr_intervals: List[float] = field(default_factory=list)
+    hr_instantaneous: List[float] = field(default_factory=list)
+    hrv_metrics: dict = field(default_factory=dict)
+    
+    # Para cardioversor
+    last_r_peak_time: Optional[float] = None
